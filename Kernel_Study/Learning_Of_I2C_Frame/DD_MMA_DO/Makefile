@@ -5,7 +5,7 @@ obj-m += mma8653_drive.o
 
 all:
 	make modules M=`pwd` -C $(KERNEL_DIR) CROSS_COMPILE=/usr/local/arm/arm-eabi-4.8/bin/arm-eabi-
-	arm-linux-gcc app.c -o app
+	arm-linux-gcc app.c -o app -lm
 clean:
 	make modules clean M=`pwd` -C  $(KERNEL_DIR) CROSS_COMPILE=/usr/local/arm/arm-eabi-4.8/bin/arm-eabi-
 	rm -rf app 
