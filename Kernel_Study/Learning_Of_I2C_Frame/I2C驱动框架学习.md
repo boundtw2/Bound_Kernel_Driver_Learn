@@ -169,7 +169,7 @@ struct i2c_client {
 
 ##### （1）i2c_adapter与i2c_algorithm
 
-​	一个I2C适配器需要i2c i2c_algorithm提供的通信函数来控制适配器产生特定的访问周期。缺少i2c_algorithm的i2c_adapter什么也做不了，因此i2c_adapter中包含所使用的i2c_algorithm 的指针。
+​	一个I2C适配器需要i2c_algorithm提供的通信函数来控制适配器产生特定的访问周期。缺少i2c_algorithm的i2c_adapter什么也做不了，因此i2c_adapter中包含所使用的i2c_algorithm 的指针。
 
 ##### （2）i2c_driver与i2c_client
 
@@ -1146,12 +1146,38 @@ i2c_register_driver()
                         └── driver->probe(client, id)  // ③ 最终调用
 ```
 
-> 关键点：
->
-> - 注册时**立即遍历**所有已存在的 adapter，尝试 detect 并创建 client；
-> - 如果设备树或 ACPI 已描述，则 detect 阶段直接匹配，不再做地址扫描。
+这里需要做出解释，此处设备驱动的probe应当是由driver_register 触发的。
+
+1. i2c_register_driver()
+
+- 先调用 driver_register(&driver->driver)
+  - 这里走通用驱动框架（bus_add_driver → driver_attach → __driver_attach → really_probe → i2c_device_probe），对“已经存在并在 i2c_bus 上注册的 struct device（i2c_client）”做匹配并调用驱动的 probe/probe_new。在6818上，对应的i2c_client应在板级文件上已经完成注册。
+  - 这一步不做地址扫描；它只处理“已经被枚举出来的设备”（比如来自设备树/ACPI/板级代码/i2c_new_client_device 等）。
+
+2. i2c_for_each_dev(driver, __process_new_driver)
+
+- “遍历已注册 adapter，检测并创建 client”的理解在语义上是对的（遍历适配器去做 legacy 探测），但具体函数名在不同内核版本上可能是 i2c_for_each_dev 或 i2c_for_each_adapter，源码注释常写“Walk the adapters that are already present”。关键不是名字，而是它会：
+  - 仅当驱动实现了 .detect 并提供 .address_list/.class 时，才对每个已存在的 adapter 调用 i2c_do_add_adapter，进而 i2c_detect。
+  - i2c_detect 内部按 address_list 对总线发探测，若确认有设备，就创建一个新的 i2c_client（路径里你写到 i2c_detect_address → device_register，这在具体实现中可能是 i2c_new_device/device_add，语义一致）。
+  - 新的 i2c_client 注册到驱动框架后，走一遍匹配/attach/probe（即你标注的“再次触发 match → 最终调用 driver->probe”）。
+
+这里并不会出现“同一设备被 probe 两次”
+
+- device 层面的单绑定：每个 struct device 只能绑定一个 dev->driver；已经绑定的设备，在后续匹配中会被跳过（__driver_attach/device_attach 会检查）。
+- 地址冲突检查：在通过 detect/new_device 创建 i2c_client 前，核心会检查该适配器上的地址是否已被占用（如 i2c_check_addr_busy），已存在就不会重复创建 client，自然也不会触发第二次 probe。
+- 并发与时序下的幂等：即使在注册期间发生并发添加/匹配，最终也只能成功绑定一次；第二次尝试会因为 dev->driver 已非空而失败/跳过。
+
+因此，更精准的表述是：
+
+- ① driver_register 负责给“已注册的 i2c_client”触发 probe；
+- ②→③ i2c_for_each_dev（或同义的适配器遍历）只在驱动支持 legacy 探测时，扫描“已注册的适配器”，发现设备后“创建新的 i2c_client”，再触发该“新设备”的 probe；
+- 同一设备不会被重复绑定，适配器上同一地址不会重复创建 client，所以不会出现实质的“双 probe 同一设备”。
+
+而现代内核/驱动多采用 DT/ACPI 等显式枚举，通常不实现 .detect，此时 i2c_for_each_dev 这条链路基本是空操作，不会创建新 client、也不会引发额外的 probe。
 
 ------
+
+
 
 ##### 三、注销接口
 
@@ -1906,3 +1932,634 @@ static int i2c_device_match(struct device *dev, struct device_driver *drv)
 - **ACPI**：x86/服务器通过 `_HID/_CID` 匹配，BIOS 与驱动双向解耦。  
 
 三条线可同时存在，**优先级 Device Tree > ACPI > id_table**，确保驱动 **一次编写，跨平台自动匹配**。
+
+### 设备驱动源码追溯
+
+#### I2C设备驱动注册
+
+主调用链（以注册驱动后自动匹配为例）
+
+- i2c_add_driver(driver)
+  - 宏展开到 i2c_register_driver(THIS_MODULE, driver)
+    - 设置 driver->driver.bus = &i2c_bus_type 等
+    - 调用 driver_register(&driver->driver)
+      - bus_add_driver(drv)
+        - 若 bus->p->drivers_autoprobe 为真（默认是），执行：
+          - driver_attach(drv)
+            - bus_for_each_dev(bus, NULL, drv, __driver_attach)
+              - __driver_attach(dev, drv)
+                - 若匹配成功 driver_match_device(drv, dev)
+                  - driver_probe_device(drv, dev)
+                    - really_probe(dev, drv)
+                      - 关键分发：
+                        - 若 dev->bus->probe 存在：调用 dev->bus->probe(dev)
+                        - 否则若 drv->probe 存在：调用 drv->probe(dev)
+
+
+
+##### **i2c_add_driver**
+
+```c
+/* use a define to avoid include chaining to get THIS_MODULE */
+
+#define i2c_add_driver(driver) \
+	i2c_register_driver(THIS_MODULE, driver)
+
+int i2c_register_driver(struct module *owner, struct i2c_driver *driver)
+{
+	int res;
+
+	/* Can't register until after driver model init */
+	if (unlikely(WARN_ON(!i2c_bus_type.p)))
+		return -EAGAIN;
+
+	/* add the driver to the list of i2c drivers in the driver core */
+	driver->driver.owner = owner;
+	driver->driver.bus = &i2c_bus_type;
+
+	/* When registration returns, the driver core
+	 * will have called probe() for all matching-but-unbound devices.
+	 */
+	res = driver_register(&driver->driver);
+	if (res)
+		return res;
+
+	/* Drivers should switch to dev_pm_ops instead. */
+	if (driver->suspend)
+		pr_warn("i2c-core: driver [%s] using legacy suspend method\n",
+			driver->driver.name);
+	if (driver->resume)
+		pr_warn("i2c-core: driver [%s] using legacy resume method\n",
+			driver->driver.name);
+
+	pr_debug("i2c-core: driver [%s] registered\n", driver->driver.name);
+
+	INIT_LIST_HEAD(&driver->clients);
+	/* Walk the adapters that are already present */
+	i2c_for_each_dev(driver, __process_new_driver);
+
+	return 0;
+}
+EXPORT_SYMBOL(i2c_register_driver);
+```
+
+###### i2c_add_driver
+
+先采用宏定义的方式将i2c_add_driver(driver)链接成了i2c_register_driver(THIS_MODULE, driver)，且此处采用宏定义方式而不是内联，这样就不需要在 I2C 头文件里去包含定义 THIS_MODULE 的头文件（如 linux/module.h），从而避免“为拿到 THIS_MODULE 而层层包含头文件”的问题。
+
+###### i2c_register_driver
+
+在i2c_register_driver中，先检查I2C子系统是否初始化，即检查全局变量 `i2c_bus_type` 是否已初始化。
+
+其中：
+
+- `unlikely()` 是一个性能优化宏，提示编译器该条件很少会为真。
+- `WARN_ON()` 是一个调试宏，如果条件为真，会在内核日志中打印警告信息。
+
+然后设置驱动的基本信息，即设置驱动的所有者模块（`owner`）和所属总线（`i2c_bus_type`）。
+
+随后调用内核的 `driver_register` 函数，将驱动注册到驱动核心（Driver Core），这里注册成功后，驱动核心会自动调用驱动的 `probe` 函数，为它绑定所有匹配的 I2C 设备。
+
+随后便检查是否使用了旧的电源管理方法（若有则输出警告信息）和输出调试信息。
+
+随后初始化驱动的 `clients` 链表，用于存储与该驱动绑定的 I2C 设备（clients）。
+
+最后遍历适配器做遗留探测（detect）。
+
+##### driger_register
+
+```c
+/**
+ * driver_register - register driver with bus
+ * @drv: driver to register
+ *
+ * We pass off most of the work to the bus_add_driver() call,
+ * since most of the things we have to do deal with the bus
+ * structures.
+ */
+int driver_register(struct device_driver *drv)
+{
+	int ret;
+	struct device_driver *other;
+
+	BUG_ON(!drv->bus->p);
+
+	if ((drv->bus->probe && drv->probe) ||
+	    (drv->bus->remove && drv->remove) ||
+	    (drv->bus->shutdown && drv->shutdown))
+		printk(KERN_WARNING "Driver '%s' needs updating - please use "
+			"bus_type methods\n", drv->name);
+
+	other = driver_find(drv->name, drv->bus);
+	if (other) {
+		printk(KERN_ERR "Error: Driver '%s' is already registered, "
+			"aborting...\n", drv->name);
+		return -EBUSY;
+	}
+
+	ret = bus_add_driver(drv);
+	if (ret)
+		return ret;
+	ret = driver_add_groups(drv, drv->groups);
+	if (ret)
+		bus_remove_driver(drv);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(driver_register);
+```
+
+###### 函数定位与职责
+
+- 位置：driver core（常见于 drivers/base/driver.c）
+- 调用路径：子系统包装调用 → driver_register(&drv->driver) → bus_add_driver(drv)
+  - 例：platform_driver_register → driver_register
+- 职责：完成驱动在“总线级”的注册。核心初始化工作交给 bus_add_driver，随后补充创建该驱动声明的默认属性组。
+
+driver_register 是驱动注册的入口薄封装：先做健全性与重名检查，再将工作交给 bus_add_driver，最后补充创建驱动声明的默认属性组；若属性组阶段失败则整体验证性回滚，保持设备模型一致、可预期。
+
+##### 所以probe如何被调用？
+
+really_probe 的核心逻辑：
+
+- 如果总线（bus_type）提供了 .probe，就优先调用 bus 的 .probe
+- 否则才直接调用通用的 device_driver.probe
+
+这使得“总线可以插入一层适配/桥接”，把通用 device 指针和通用回调，转成该总线特定的 probe 形参与语义。
+
+1. I2C 的专属桥接：bus->probe = i2c_device_probe
+
+I2C 总线的 bus_type 通常定义在 drivers/i2c/i2c-core-base.c，形如：
+
+```c
+.match = i2c_device_match
+.probe = i2c_device_probe
+.remove = i2c_device_remove
+```
+
+i2c_device_probe 的典型步骤（简化示意）：
+struct i2c_client *client = to_i2c_client(dev);
+struct i2c_driver *drv = to_i2c_driver(dev->driver); // 通过 container_of 从通用 device_driver 找回外层 i2c_driver
+如果 drv->probe_new 存在，调用 drv->probe_new(client)
+否则根据 id_table 匹配得到 const struct i2c_device_id *id，再调用 drv->probe(client, id)
+**关键点：**
+i2c 驱动的“真正 probe 回调”存放在 struct i2c_driver 里（probe 或 probe_new），而不是放在通用的 device_driver.probe 里。
+因此需要 bus 的 .probe（即 i2c_device_probe）做**“桥接/适配”**，把通用的 struct device_driver/struct device 转回 I2C 语义对象，并转调 i2c_driver 的 probe。
+这也解释了“probe 是如何传到 really_probe 的”：实际上，probe 指针并没有直接“传进 really_probe”，而是 really_probe 里通过“先调用 bus->probe（i2c_device_probe）”，再由 bus->probe 通过 container_of 找回 i2c_driver，从而调用到 i2c_driver 的 .probe/.probe_new。
+
+2. 两条常见触发路径
+
+驱动注册时自动匹配（上面详述）
+条件：bus->p->drivers_autoprobe = true（I2C 默认如此）
+栈回溯示意：
+i2c_add_driver → driver_register → bus_add_driver → driver_attach → driver_attach → driver_probe_device → really_probe → i2c_device_probe → i2c_driver->probe(_new)
+设备后到（热插/晚注册）匹配
+当新 I2C 设备被注册（例如 i2c_new_client_device/of/ACPI 枚举到）时，device_add 会触发与已注册驱动匹配，之后路径会在 dd.c 中走到 device_attach/device_attach_driver/driver_probe_device/really_probe，最终仍是 really_probe → i2c_device_probe → i2c_driver->probe(_new)。
+
+3. 与 device_driver.probe 的关系（对比说明）
+
+模型里有两种模式：
+Bus 层提供 bus->probe（I2C、USB 等常见）：really_probe 先走 bus->probe，bus 层做语义适配，调用“总线自有的 driver 结构体里的 probe”（如 i2c_driver->probe）
+Bus 层不提供 bus->probe：驱动把通用的 drv->probe 设为一个总线适配的包装器（wrapper），really_probe 会直接调 drv->probe，wrapper 再做 container_of 和类型转换
+I2C 采用的是第 1 种，因此 i2c_driver 一般不设置 driver.driver.probe，避免旧内核里出现“同时设置 bus->probe 与 drv->probe 的警告”。
+
+4. 小结
+
+i2c_add_driver 通过 driver_register → bus_add_driver，把驱动挂到 I2C 总线上；若启用 autoprobe，就会立即遍历现有设备并尝试绑定。
+真正调用你驱动里 probe 的路径会经过：
+driver_probe_device → really_probe → dev->bus->probe（i2c_device_probe）→ i2c_driver->probe 或 probe_new
+“probe 如何传到 really_probe”：不是把 i2c_driver->probe 指针直接传入，而是 really_probe 根据“bus 是否定义 .probe”来决定调用 i2c_device_probe；该函数利用 dev->driver 指向的通用 device_driver，container_of 回到外层 i2c_driver，再转调 i2c_driver 的 probe。这就是“总线层桥接”的关键。
+
+#### 那么i2c_client是在哪里出生的？
+
+以目前研究的6818中的板级文件方式为例
+
+在arch\arm\plat-s5p6818\x6818\devices.c中已经写好了mma8653的i2c_board_info，设备初始化加载时就已经通过该板级文件调用i2c_register_board_info(2, &mma865x_i2c_bdi, 1);把其注册在编号为2的i2c适配器下当 i2c-2 控制器调用 i2c_register_adapter() 时，内核自动执行 i2c_scan_static_board_info()，遍历链表并匹配 busnum == 2 的条目，创建 i2c_client。
+
+#### SMBus 调用链路
+
+i2c_smbus_read_byte_data(client, reg)  // 用户调用
+  └── i2c_smbus_xfer()  // drivers/i2c/i2c-core-smbus.c
+      ├── 检查 adap->algo->smbus_xfer
+      └── 为 NULL → 调用 i2c_smbus_xfer_emulated()  // 软件模拟
+          └── 构造 I2C 消息数组（写地址+读数据）
+              └── i2c_transfer(adap, msgs, num)  // 回退到 master_xfer
+                  └── adap->algo->master_xfer(adap, msgs, num)  // 调用 i2c-gpio 的位 bang 实现
+                      └── i2c_gpio_xfer()  // 最终执行 GPIO 模拟时序
+
+### 适配器驱动源码追溯
+
+源码目录：drivers\i2c\busses
+
+#### i2c_gpio_private_data结构体
+
+```c
+struct i2c_gpio_private_data {
+	struct i2c_adapter adap;
+	struct i2c_algo_bit_data bit_data;
+	struct i2c_gpio_platform_data pdata;
+};
+```
+
+
+
+##### 总体说明
+
+- 这是驱动的“私有包”——把与一个 i2c-gpio 实例相关的三个关键对象放在一个连续的结构体里。probe 中用 devm_kzalloc 分配这块内存，并通过 platform_set_drvdata 挂到 platform_device 上，remove 时通过 platform_get_drvdata 取回，便于管理生命周期和错误回滚。三个成员都是嵌入式对象（不是指针），因此它们的地址在内存中稳定，可以直接取地址传给内核其它子系统（比如 i2c 核心或回调）。
+
+##### struct i2c_adapter adap
+
+- 在本驱动中的作用
+  - 表示该驱动向 I2C 子系统注册的适配器（即一条 I2C 总线控制器的抽象）。
+  - 通过填充 adap 的若干字段并注册，内核及上层 I2C 驱动就能通过该适配器进行 I2C 传输并在 sysfs 中看到该总线。
+- 在代码中的具体用途（引用点）
+  - 在 probe 中填充字段：
+    - adap->owner = THIS_MODULE;
+    - snprintf(adap->name, ... , "i2c-gpio%d", pdev->id);
+    - adap->algo_data = bit_data; // 把位算法数据指给适配器
+    - adap->class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
+    - adap->dev.parent = &pdev->dev;
+    - adap->dev.of_node = pdev->dev.of_node;
+    - adap->nr = (pdev->id != -1) ? pdev->id : 0;
+  - 调用 i2c_bit_add_numbered_bus(adap) 注册适配器：
+    - i2c_bit_add_numbered_bus 会把 adap->algo 设为 i2c-algo-bit 提供的算法，并把适配器加入 I2C 框架（使其可用）。
+  - remove 时通过 i2c_del_adapter(&priv->adap) 注销适配器。
+- 为什么放在私有结构体中
+  - 适配器对象需要和对应的 GPIO/平台数据关联（在 remove 时需要），将其与其它数据放在同一私有块便于管理与 cleanup。
+  - i2c 核心会持有对 adap 的引用（master_xfer 路径），所以应保持内存直到 unregister。
+
+##### struct i2c_algo_bit_data bit_data
+
+- 在本驱动中的作用
+  - 这是 i2c-algo-bit（通用位操作 I2C 算法）期望的参数/回调容器。它包含 setsda/setscl/getsda/getscl 回调指针、时序 udelay、timeout、以及一个 data 指针用于回调访问平台数据。
+  - 驱动通过填充该结构把 GPIO 操作细节交给 i2c-algo-bit，由后者实现 I2C 协议（START/STOP、读写位、ACK、时钟拉伸等待等）。
+- 在代码中的具体用途（引用点）
+  - 在 probe 中被填充：
+    - bit_data->setsda = i2c_gpio_setsda_val 或 i2c_gpio_setsda_dir（根据 pdata 配置选择）
+    - bit_data->setscl = i2c_gpio_setscl_val 或 i2c_gpio_setscl_dir
+    - 如果允许时钟拉伸则 bit_data->getscl = i2c_gpio_getscl
+    - bit_data->getsda = i2c_gpio_getsda
+    - bit_data->udelay = pdata->udelay 或 默认值 (5 或 50)
+    - bit_data->timeout = pdata->timeout 或 默认 HZ/10
+    - bit_data->data = pdata; // 把平台数据地址供回调使用
+  - 把 bit_data 的地址放到 adap->algo_data（adap->algo_data = bit_data），i2c-algo-bit 在运行时会通过 adapter->algo_data 拿到这些回调和参数。
+- 为什么放在私有结构体中
+  - bit_data 引用 pdata（通过 bit_data->data = pdata），且要与 adap 一起长期存在直到适配器注销；放在同一私有块可保证一致的生命周期和内存连贯性。
+  - 回调指针指向静态函数（定义在同一源文件），而 data 指向私有 pdata，因此 embedding 避免了额外分配与指针管理。
+
+##### struct i2c_gpio_platform_data pdata
+
+- 在本驱动中的作用
+  - 存储平台/设备树提供的配置信息：SDA/SCL 的 GPIO 编号、是否为开漏、是否 SCL 仅输出、udelay、timeout 等。这些是驱动配置与回调运行时需要的原始参数。
+- 在代码中的具体用途（引用点）
+  - 在 probe 的开始由 of_i2c_gpio_probe(...)（设备树）或 memcpy(platform_data) 填充 pdata：
+    - pdata->sda_pin、pdata->scl_pin
+    - pdata->sda_is_open_drain、pdata->scl_is_open_drain、pdata->scl_is_output_only
+    - pdata->udelay、pdata->timeout（转换后的 jiffies）
+  - probe 使用 pdata 的内容来：
+    - 调用 gpio_request(pdata->sda_pin/scl_pin) 申请 GPIO。
+    - 根据 open-drain/输出标志设置 gpio_direction_input/output 并选择对应的 setsda/setscl 回调。
+    - 决定是否设置 getscl（基于 scl_is_output_only）。
+    - 决定 bit_data->udelay 与 bit_data->timeout 的值（若 pdata 指定则使用）。
+  - bit_data->data = pdata：把 pdata 的地址传给位算法回调，回调通过 (struct i2c_gpio_platform_data *)data 读取 pin 编号并调用 gpio_set_value/gpio_direction/gpio_get_value。
+- 为什么放在私有结构体中
+  - pdata 是与该适配器紧密绑定的配置信息，回调在运行时需要访问它。把它放在私有结构体保证回调取到的数据在适配器生命周期内有效。
+  - 也避免了对 platform_data 进行额外复制/分配，保证所有相关数据放在一处。
+
+##### 相互关系与指针流向（关键点）
+
+- 内存布局：priv（devm 分配）包含 adap、bit_data、pdata，地址稳定。
+- adapter -> algo_data = &priv->bit_data：i2c-algo-bit 通过 adapter->algo_data 访问回调/参数。
+- bit_data->data = &priv->pdata：回调收到 data 参数后能读取具体的 GPIO 编号和标志以进行 gpio_set/get/direction。
+- 回调函数（如 i2c_gpio_setsda_val/dir 等）原型是 (void *data, int state)；它们会把 void *data 强转为 struct i2c_gpio_platform_data * 并使用 pdata->sda_pin/scl_pin。
+- platform_set_drvdata(pdev, priv)：把 priv 关联到 platform_device，remove 时通过 platform_get_drvdata 取回，进而调用 i2c_del_adapter(&priv->adap) 和 gpio_free(pdata->*); 所以 priv 必须在 probe 成功后存在直到 remove。
+
+##### 生命周期与资源管理
+
+- 内存（priv）分配：devm_kzalloc，随 device 释放自动 free（不需显式 free）。
+- GPIO 资源申请：gpio_request（不是 devm），因此在错误或 remove 时需要显式 gpio_free。probe 的错误路径正确释放已申请的 GPIO。
+- 适配器注册：i2c_bit_add_numbered_bus 成功后，适配器被内核持有；remove 时通过 i2c_del_adapter 注销。
+- 因为 adap、bit_data、pdata 都嵌入在同一私有块中，保证在适配器活跃期间这些数据地址始终有效，避免悬空引用。
+
+#### 驱动代码中的两组回调区别
+
+- val（value）方式通过写输出电平（gpio_set_value）来控制线的高低。
+- dir（direction）方式通过改变引脚方向（gpio_direction_input / gpio_direction_output(..., 0)）来控制线：输入表示释放线（高阻），输出且写 0 表示拉低。
+
+下面详细解释、对比和影响。
+
+##### 原理对比
+
+- val（写值）：
+  - 假设 GPIO 配置为开漏（open-drain）或被配置为“可以安全写 1 表示释放”的模式。
+  - gpio_set_value(pin, 0) -> 驱动输出低（拉低线）
+  - gpio_set_value(pin, 1) -> 释放输出驱动（对于开漏此时是高阻，外部上拉把线拉高）
+- dir（切换方向）：
+  - 通过方向切换来模拟开漏：
+    - gpio_direction_output(pin, 0) -> 主动拉低
+    - gpio_direction_input(pin) -> 变为输入（高阻），外部上拉把线拉高
+  - 适用于那些不支持硬件开漏但可以通过输入（高阻）/输出0 模拟开漏的 GPIO。
+
+##### 代码中何时用哪种方式
+
+- 如果平台/设备树表明引脚是真正的 open-drain（sda_is_open_drain / scl_is_open_drain），驱动会把引脚配置为输出并用 sets*_val（gpio_set_value）。
+- 如果不是 open-drain，驱动用 sets*_dir（通过改变方向来实现释放/拉低）。
+- 对 SCL，还有一个特殊标志 scl_is_output_only：若为真，驱动把 SCL 设为输出并用 setscl_val（不能读 SCL，也就不支持时钟拉伸检测）。
+
+##### 电气与兼容性差别
+
+- val 合法条件：
+  - GPIO 硬件/控制器实际工作在开漏或能够在写 1 时断开驱动（高阻）。很多 SoC 的 GPIO 控制器支持“open-drain”属性，或者在设备树中能声明为 open-drain。
+  - 如果 GPIO 是推挽（push-pull）且你用 gpio_set_value(pin, 1)，会主动驱动高电平，这会和其他设备（或从设备想拉低线）冲突，破坏 I2C 总线。
+- dir 的优点/缺点：
+  - 优点：能在不支持开漏输出的 GPIO 上工作（用方向切换实现）。更“通用”。
+  - 缺点：依赖外部上拉电阻；方向切换开销（有时比单纯写值慢）；在某些 GPIO 控制器上，切换方向/读取瞬间状态可能有微妙时序差异或寄存器语义问题。
+- 时钟拉伸：
+  - 若 SCL 是 output-only（只输出），驱动不会提供 getscl（读 SCL），i2c-algo-bit 不会等待从机释放 SCL（即不支持钟拉伸）。这通常与使用 setscl_val（输出写值）相关联。
+  - 若用 dir 且能读取 SCL（getscl 可用），算法能检测从机拉低 SCL（支持时钟拉伸）。
+
+#### i2c_gpio_probe
+
+```c
+static int __devinit i2c_gpio_probe(struct platform_device *pdev)
+{
+	struct i2c_gpio_private_data *priv;
+	struct i2c_gpio_platform_data *pdata;
+	struct i2c_algo_bit_data *bit_data;
+	struct i2c_adapter *adap;
+	int ret;
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	adap = &priv->adap;
+	bit_data = &priv->bit_data;
+	pdata = &priv->pdata;
+
+	if (pdev->dev.of_node) {
+		ret = of_i2c_gpio_probe(pdev->dev.of_node, pdata);
+		if (ret)
+			return ret;
+	} else {
+		if (!pdev->dev.platform_data) 
+			return -ENXIO;
+		memcpy(pdata, pdev->dev.platform_data, sizeof(*pdata));
+	}
+
+	ret = gpio_request(pdata->sda_pin, "sda");
+	if (ret)
+		goto err_request_sda;
+	ret = gpio_request(pdata->scl_pin, "scl");
+	if (ret)
+		goto err_request_scl;
+
+	if (pdata->sda_is_open_drain) {
+		gpio_direction_output(pdata->sda_pin, 1);
+		bit_data->setsda = i2c_gpio_setsda_val;
+	} else {
+		gpio_direction_input(pdata->sda_pin);
+		bit_data->setsda = i2c_gpio_setsda_dir;
+	}
+
+	if (pdata->scl_is_open_drain || pdata->scl_is_output_only) {
+		gpio_direction_output(pdata->scl_pin, 1);
+		bit_data->setscl = i2c_gpio_setscl_val;
+	} else {
+		gpio_direction_input(pdata->scl_pin);
+		bit_data->setscl = i2c_gpio_setscl_dir;
+	}
+
+	if (!pdata->scl_is_output_only)
+		bit_data->getscl = i2c_gpio_getscl;
+	bit_data->getsda = i2c_gpio_getsda;
+
+	if (pdata->udelay)
+		bit_data->udelay = pdata->udelay;
+	else if (pdata->scl_is_output_only)
+		bit_data->udelay = 50;			/* 10 kHz */
+	else
+		bit_data->udelay = 5;			/* 100 kHz */
+
+	if (pdata->timeout)
+		bit_data->timeout = pdata->timeout;
+	else
+		bit_data->timeout = HZ / 10;		/* 100 ms */
+
+	bit_data->data = pdata;
+
+	adap->owner = THIS_MODULE;
+	snprintf(adap->name, sizeof(adap->name), "i2c-gpio%d", pdev->id);
+	adap->algo_data = bit_data;
+	adap->class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
+	adap->dev.parent = &pdev->dev;
+	adap->dev.of_node = pdev->dev.of_node;
+
+	/*
+	 * If "dev->id" is negative we consider it as zero.
+	 * The reason to do so is to avoid sysfs names that only make
+	 * sense when there are multiple adapters.
+	 */
+	adap->nr = (pdev->id != -1) ? pdev->id : 0;
+	ret = i2c_bit_add_numbered_bus(adap);
+	if (ret)
+		goto err_add_bus;
+
+	of_i2c_register_devices(adap);
+
+	platform_set_drvdata(pdev, priv);
+
+	dev_info(&pdev->dev, "using pins %u (SDA) and %u (SCL%s)\n",
+		 pdata->sda_pin, pdata->scl_pin,
+		 pdata->scl_is_output_only
+		 ? ", no clock stretching" : "");
+
+	return 0;
+
+err_add_bus:
+	gpio_free(pdata->scl_pin);
+err_request_scl:
+	gpio_free(pdata->sda_pin);
+err_request_sda:
+	return ret;
+}
+```
+
+##### 函数目的
+
+- 把一个 platform 设备（可能由设备树/ACPI/板级代码创建）绑定成一个“基于 GPIO 的 I2C 主机适配器”，并注册到 I2C 核心。
+- 关键工作：解析配置（GPIO 与电气/时序属性）、申请并初始化 GPIO、把 GPIO 操作回调装配进 i2c-algo-bit 的位操作算法、注册适配器并枚举子设备、建立驱动私有数据，处理错误路径释放资源。
+
+##### 逐块解析
+
+###### 1. 分配并初始化私有数据
+
+- 代码:
+  - priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+  - adap = &priv->adap; bit_data = &priv->bit_data; pdata = &priv->pdata;
+- 含义与原因:
+  - 使用 devm_kzalloc 分配“设备管理的”零填充内存：随 device 生命周期自动释放，减少手动清理负担（但注意 GPIO 是非 devm 申请的，后面会手动 free）。
+  - 将三个紧密关联的对象打包：
+    - adap: I2C 适配器对象，注册到 I2C 核心。
+    - bit_data: 给 i2c-algo-bit 的回调与参数。
+    - pdata: 平台参数（GPIO 编号、电气属性、时序参数）。
+- 失败处理:
+  - 分配失败返回 -ENOMEM。
+
+###### 2.获取平台配置（设备树 or 传统 platform_data）
+
+- 代码:
+  - if (pdev->dev.of_node) ret = of_i2c_gpio_probe(...);
+  - else 从 pdev->dev.platform_data memcpy 到 pdata；若没有则返回 -ENXIO。
+- 含义与原因:
+  - 设备树路径：从 OF 节点解析 SDA/SCL GPIO、开漏/仅输出属性、延时/超时等，统一填入 pdata。
+  - 非设备树路径：依赖平台代码提供 struct i2c_gpio_platform_data。（arch/arm/mach-s5p6818/devices.c）
+- 错误条件:
+  - 设备树缺关键属性或解析失败，返回解析的错误码。
+  - 非 OF 且没有 platform_data，返回 -ENXIO（设备不存在/无法驱动）。
+
+###### 3. 申请 GPIO 资源
+
+- 代码:
+  - gpio_request(pdata->sda_pin, "sda")
+  - gpio_request(pdata->scl_pin, "scl")
+- 含义与原因:
+  - 向 GPIO 子系统声明占用 SDA/SCL 引脚，便于调试和避免冲突。"sda"/"scl" 作为标签用于调试可见性。
+- 错误路径:
+  - 若申请 SDA 失败，跳转 err_request_sda 直接返回。
+  - 若申请 SCL 失败，跳转 err_request_scl，释放已申请的 SDA 后返回。
+
+###### 4. 按电气属性配置 GPIO 方向/初值并选择“如何拉高/拉低”的回调
+
+- SDA 配置:
+  - 若 sda_is_open_drain:
+    - gpio_direction_output(sda, 1); bit_data->setsda = i2c_gpio_setsda_val;
+    - 逻辑：开漏输出模式，输出“1”表示释放（高阻，由外部上拉拉高），输出“0”表示拉低。
+  - 否则:
+    - gpio_direction_input(sda); bit_data->setsda = i2c_gpio_setsda_dir;
+    - 逻辑：用“切换方向”模拟开漏：输入=高阻（释放），输出0=拉低。
+- SCL 配置:
+  - 若 scl_is_open_drain 或 scl_is_output_only:
+    - gpio_direction_output(scl, 1); bit_data->setscl = i2c_gpio_setscl_val;
+    - 说明：开漏或“仅输出”都通过写值拉高/拉低。仅输出意味着后续不支持时钟拉伸。
+  - 否则:
+    - gpio_direction_input(scl); bit_data->setscl = i2c_gpio_setscl_dir;
+    - 说明：非开漏时同样依赖“切换方向”实现释放/拉低。
+- 为什么分两套策略:
+  - 真·开漏硬件：可以通过写值直接释放/拉低，简单可靠。
+  - 非开漏硬件：通过方向切换达到“高阻/拉低”的等效效果，满足 I2C 线与逻辑。
+- gets 回调:
+  - 若不是 scl-output-only：bit_data->getscl = i2c_gpio_getscl（用于检测时钟拉伸）。
+  - 始终设置 getsda = i2c_gpio_getsda（用于读位/ACK 检测）。
+
+###### 5. 设置位时序参数 udelay 与超时 timeout
+
+- 代码:
+  - udelay:
+    - 若 pdata->udelay 指定则使用；
+    - 否则：scl-output-only => 50us（约 10 kHz）；否则 5us（约 100 kHz）。
+  - timeout:
+    - 若 pdata->timeout 指定则使用；
+    - 否则默认 HZ/10（约 100ms）。
+- 含义与原因:
+  - udelay 控制位翻转之间的延迟，决定 I2C 近似速率；仅输出 SCL 时选择更慢的默认值以提升兼容性。
+  - timeout 用于等待 SCL 变高（时钟拉伸）等超时控制；单位是 jiffies（设备树解析中若给了毫秒会先转 jiffies）。
+- bit_data->data = pdata:
+  - 把平台参数指针传给位回调，回调通过 data 拿到 gpio 编号等。
+
+###### 6. 填充适配器并注册为 I2C 总线
+
+- 代码:
+  - adap->owner = THIS_MODULE
+  - snprintf(adap->name, "i2c-gpio%d", pdev->id)
+  - adap->algo_data = bit_data
+  - adap->class = I2C_CLASS_HWMON | I2C_CLASS_SPD
+  - adap->dev.parent = &pdev->dev; adap->dev.of_node = pdev->dev.of_node
+  - adap->nr = (pdev->id != -1) ? pdev->id : 0
+  - ret = i2c_bit_add_numbered_bus(adap)
+- 含义与原因:
+  - owner 指向当前模块，防止卸载中使用。
+  - name 为调试友好的适配器名称。
+  - algo_data 告诉 i2c-algo-bit 我们的 GPIO 回调和参数在哪。
+  - class 标注此总线常见的设备类别（硬件监控 HWMON 和 SPD 内存条），便于某些自动探测或驱动策略。
+  - parent/of_node 关联设备树节点，使后续 of_i2c_register_devices 能找到并实例化子节点。
+  - nr 指定“编号总线”（如 i2c-<nr>）；若 pdev->id 为 -1 则强制用 0，避免只有一个适配器时生成奇怪的 sysfs 名称。
+  - i2c_bit_add_numbered_bus 的关键作用：
+    - 内部会把 adap->algo 设置为 i2c-algo-bit 提供的通用算法（i2c_bit_algo），并完成适配器注册。
+    - 之后 I2C 核心的 master_xfer 将由该算法实现，算法再回调我们提供的 setsda/setscl/getsda/getscl 来“抖”GPIO。
+
+###### 7. 枚举并注册设备树子设备
+
+- 代码:
+  - of_i2c_register_devices(adap)
+- 含义与原因:
+  - 扫描适配器的 of_node 下的子节点（即挂在此 I2C 总线上的从设备），为每个子节点创建 i2c_client 并绑定相应驱动。
+
+###### 8. 建立驱动私有数据并打印信息
+
+- 代码:
+  - platform_set_drvdata(pdev, priv)
+  - dev_info(..., "using pins %u (SDA) and %u (SCL%s)\n", ..., pdata->scl_is_output_only ? ", no clock stretching" : "")
+- 含义与原因:
+  - 将 priv 存入平台设备，供 remove 时取回。
+  - 打印所用引脚及是否禁用“时钟拉伸”（scl-output-only），便于排错。
+
+###### 9. 成功返回与错误回滚路径
+
+- 正常返回 0。
+- 错误回滚:
+  - err_add_bus: gpio_free(scl) -> fallthrough 到 err_request_scl
+  - err_request_scl: gpio_free(sda) -> fallthrough 到 err_request_sda
+  - err_request_sda: return ret
+- 说明:
+  - 典型“台阶式”回滚：每失败一步释放之前成功的资源，避免泄漏。
+  - 注意 GPIO 不是 devm 申请，必须手动释放；内存是 devm 分配，会自动回收。
+
+##### 与运行时的关系
+
+- 注册成功后，任何对该适配器的 I2C 传输请求都会走 i2c-algo-bit 的 master_xfer。
+- master_xfer 利用本函数设置的 bit_data（回调与参数），调 setsda/setscl/getsda/getscl 产生 I2C 起始/停止、数据/ACK、以及（若可）时钟拉伸等待，udelay 决定节拍、timeout 控制等待上限。
+
+##### 重要函数
+
+###### i2c_bit_add_numbered_bus( )
+
+```c
+ret = i2c_bit_add_numbered_bus(adap);
+	if (ret)
+		goto err_add_bus;
+```
+
+- 含义
+  - 调用 i2c-algo-bit 提供的 helper 函数，将你的 adapter 注册为 bit-banged（位操作）I2C 总线并请求分配/占用 adap->nr 号。
+- i2c_bit_add_numbered_bus 做了什么（内部要点）
+  - 将 adap->algo 指向 i2c-algo-bit 中实现的通用算法结构（如 i2c_bit_algo）；
+  - 使用 adap->algo_data（你已设置为指向 bit_data）让算法知道如何操作 SDA/SCL；
+  - 调用 i2c_add_numbered_adapter(adap)（或等价流程）把适配器加入 I2C 子系统，并尝试使用 adap->nr 指定的总线号；
+  - 做必要的初始化工作以便 master_xfer 能调度到 bit 算法。
+- 返回值/错误处理
+  - 成功返回 0；失败返回负 errno（例如总线号冲突、资源不足等）。
+  - 若失败，代码跳转到 err_add_bus 标签执行资源回滚（释放已 request 的 GPIO），然后返回错误。
+- 语义影响
+  - 在这行成功后，适配器被内核 I2C 子系统登记，外部（其它驱动/内核子系统）可以通过该适配器进行 I2C 传输；同时适配器可能在 sysfs 中出现（i2c-<nr>）并可被用户空间（i2c-dev 等）访问。
+
+###### of_i2c_register_devices()
+
+- 含义
+  - 如果适配器对应的 device 树节点下有子节点（描述挂在这条 I2C 总线上的从设备），该函数会解析这些子节点并为它们创建对应的 i2c_client（board info -> i2c_new_device），以便与相应的从设备驱动匹配并绑定。
+- 为什么要在 i2c_bit_add_numbered_bus 之后调用
+  - of_i2c_register_devices 需要一个已经注册到 I2C 子系统的 adapter（即内核已经知道这条总线，并能为新创建的 i2c_client 找到它对应的 adapter）。如果先注册子设备，而适配器尚未注册，设备绑定可能失败或被延迟。
+- 作用细节
+  - 解析 device tree 子节点（通常会从子节点读取 reg/address、compatible、驱动数据等），生成 struct i2c_board_info（或 of equivalent），然后调用 i2c_new_device（或 of_i2c_register_board_info 风格的接口）创建 i2c_client。
+  - 如果没有任何子节点，函数几乎没有行为（无错误）。
+- 后果
+  - 使得用设备树描述的 I2C 从设备能自动被内核实例化并与驱动匹配（例如某个传感器的驱动会 probe）。
+
+###### platform_set_drvdata(pdev, priv);
+
+- 含义
+  - 把本 probe 中分配的私有结构体 priv（包含 adap、bit_data、pdata）与 platform_device 关联起来，内核会把它保存在 pdev->dev.driver_data 中。
+- 目的
+  - 在 remove（卸载驱动或设备）或其他需要访问私有数据的地方，可以通过 platform_get_drvdata(pdev) 取回 priv，从而进行清理（例如 i2c_del_adapter / gpio_free）或状态查询。
+- 生命周期/约定
+  - 在 probe 成功返回后，驱动应保证在 remove 时通过 platform_get_drvdata 取得同一 priv 并释放资源。
+  - 这是典型的驱动私有数据存储模式。
+
